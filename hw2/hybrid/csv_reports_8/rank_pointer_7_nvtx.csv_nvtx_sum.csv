@@ -1,0 +1,4 @@
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Style,Range
+53.9,4663657694,1,4663657694.0,4663657694.0,4663657694,4663657694,0.0,PushPop,:Main
+46.0,3974743863,617,6442048.4,6397243.0,5084720,17294229,941212.7,PushPop,:Computation
+0.1,8546374,1235,6920.1,3765.0,1978,286843,26008.3,PushPop,:Communication

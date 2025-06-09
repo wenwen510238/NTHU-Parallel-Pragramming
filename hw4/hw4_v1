@@ -1,0 +1,344 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+#include <sys/time.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+void input(char *input_filename);
+void output(char *output_filename);
+void flash_attention(float *q_d, float *k_d, float *v_d, float *o_d);
+
+__global__ void init_m_kernel(float *m_d, int N);
+__global__ void QKDotAndScalar_CUDA(float *q_d, float *k_d, float *sij_d, int br, int bc, int d, float scalar);
+__global__ void RowMax_CUDA(float *mij_d, float *sij_d, int br, int bc);
+__global__ void MinusMaxAndExp_CUDA(float *pij_d, float *sij_d, float *mij_d, int br, int bc);
+__global__ void RowSum_CUDA(float *lij_d, float *pij_d, int br, int bc);
+__global__ void ComputeMiLiNew_CUDA(float *mi_d, float *li_d, float *mij_d, float *lij_d, float *mi_new_d, float *li_new_d, int br);
+__global__ void UpdateOi_CUDA(float *oi_d, float *mi_d, float *li_d, float *mi_new_d, float *li_new_d, float *pij_d, float *vj_d, float *mij_d, int br, int bc, int d);
+__global__ void CopyMiLiNew_CUDA(float *mi_d, float *li_d, float *mi_new_d, float *li_new_d, int br);
+
+float _max(float a, float b) { return a > b ? a : b; }
+float _min(float a, float b) { return a < b ? a : b; }
+double getTimeStamp() {
+    struct timeval tv;
+    gettimeofday( &tv, NULL );
+    return (double) tv.tv_usec/1000000 + tv.tv_sec;
+}
+
+int B, N, d;
+float *Q, *K, *V, *O;
+float *Q_d, *K_d, *V_d, *O_d;
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        printf("Usage: %s <input_filename> <output_filename>\n", argv[0]);
+        return 1;
+    }
+
+    input(argv[1]);
+
+    double start, end;
+    start = getTimeStamp();
+
+    for (int i = 0; i < B; i++) {
+        flash_attention(
+            Q_d + (i * N * d),
+            K_d + (i * N * d),
+            V_d + (i * N * d),
+            O_d + (i * N * d)
+        );
+    }
+
+    end = getTimeStamp();
+    printf("(B, N, d): (%d, %d, %d)\n", B, N, d);
+    printf("Time: %.3f seconds\n", end - start);
+
+    output(argv[2]);
+
+    return 0;
+}
+
+void input(char *input_filename) {
+    FILE *file = fopen(input_filename, "rb");
+
+    fread(&B, sizeof(int), 1, file);
+    fread(&N, sizeof(int), 1, file);
+    fread(&d, sizeof(int), 1, file);
+
+    size_t total_size = B * N * d * sizeof(float);
+
+    Q = (float *)malloc(total_size);
+    K = (float *)malloc(total_size);
+    V = (float *)malloc(total_size);
+    O = (float *)malloc(total_size);
+
+    for (int i = 0; i < B; i++) {
+        fread(Q + (i * N * d), sizeof(float), N * d, file);
+        fread(K + (i * N * d), sizeof(float), N * d, file);
+        fread(V + (i * N * d), sizeof(float), N * d, file);
+    }
+    memset(O, 0x00, total_size);
+
+    fclose(file);
+
+    // Allocate device memory
+    cudaMalloc((void **)&Q_d, total_size);
+    cudaMalloc((void **)&K_d, total_size);
+    cudaMalloc((void **)&V_d, total_size);
+    cudaMalloc((void **)&O_d, total_size);
+
+    // Copy data from host to device
+    cudaMemcpy(Q_d, Q, total_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(K_d, K, total_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(V_d, V, total_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(O_d, O, total_size, cudaMemcpyHostToDevice);
+}
+
+void output(char *output_filename) {
+    size_t total_size = B * N * d * sizeof(float);
+
+    // Copy data from device to host
+    cudaMemcpy(O, O_d, total_size, cudaMemcpyDeviceToHost);
+
+    FILE *file = fopen(output_filename, "wb");
+
+    fwrite(O, sizeof(float), B * N * d, file);
+
+    free(Q);
+    free(K);
+    free(V);
+    free(O);
+
+    // Free device memory
+    cudaFree(Q_d);
+    cudaFree(K_d);
+    cudaFree(V_d);
+    cudaFree(O_d);
+
+    fclose(file);
+}
+
+void flash_attention(float *q_d, float *k_d, float *v_d, float *o_d) {
+    // Allocate temporary arrays on device
+    float *l_d, *m_d;
+    cudaMalloc((void **)&l_d, N * sizeof(float));
+    cudaMalloc((void **)&m_d, N * sizeof(float));
+
+    // Initialize l_d to zeros
+    cudaMemset(l_d, 0, N * sizeof(float));
+
+    // Initialize m_d to -FLT_MAX
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+    init_m_kernel<<<blocksPerGrid, threadsPerBlock>>>(m_d, N);
+
+    // Other temporary arrays
+    float *kj_d, *vj_d, *qi_d, *oi_d, *li_d, *mi_d;
+    float *sij_d, *pij_d, *mij_d, *lij_d;
+    float *mi_new_d, *li_new_d;
+
+    // int a = 4*d;
+    // int bc = N/a, br = _min(N/a, d);
+    // if (N % a != 0) bc++;
+
+    int bc = 32, br = 32;
+
+    int tr = N / br, tc = N / bc;
+    if (N % br != 0) tr++;
+    if (N % bc != 0) tc++;
+
+    size_t kj_size = bc * d * sizeof(float);
+    size_t vj_size = bc * d * sizeof(float);
+    size_t qi_size = br * d * sizeof(float);
+    size_t oi_size = br * d * sizeof(float);
+    size_t li_size = br * sizeof(float);
+    size_t mi_size = br * sizeof(float);
+    size_t sij_size = br * bc * sizeof(float);
+    size_t pij_size = br * bc * sizeof(float);
+    size_t mij_size = br * sizeof(float);
+    size_t lij_size = br * sizeof(float);
+
+    cudaMalloc((void **)&kj_d, kj_size);
+    cudaMalloc((void **)&vj_d, vj_size);
+    cudaMalloc((void **)&qi_d, qi_size);
+    cudaMalloc((void **)&oi_d, oi_size);
+    cudaMalloc((void **)&li_d, li_size);
+    cudaMalloc((void **)&mi_d, mi_size);
+    cudaMalloc((void **)&sij_d, sij_size);
+    cudaMalloc((void **)&pij_d, pij_size);
+    cudaMalloc((void **)&mij_d, mij_size);
+    cudaMalloc((void **)&lij_d, lij_size);
+    cudaMalloc((void **)&mi_new_d, mi_size);
+    cudaMalloc((void **)&li_new_d, li_size);
+
+    for (int j = 0; j < tc; j++) {
+        int current_bc = bc;
+        if ((j + 1) * bc > N) {
+            current_bc = N - j * bc;
+        }
+
+        cudaMemcpy(kj_d, k_d + j * bc * d, current_bc * d * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(vj_d, v_d + j * bc * d, current_bc * d * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        for (int i = 0; i < tr; i++) {
+            int current_br = br;
+            if ((i + 1) * br > N) {
+                current_br = N - i * br;
+            }
+
+            cudaMemcpy(qi_d, q_d + i * br * d, current_br * d * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(oi_d, o_d + i * br * d, current_br * d * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(li_d, l_d + i * br, current_br * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(mi_d, m_d + i * br, current_br * sizeof(float), cudaMemcpyDeviceToDevice);
+
+            dim3 blockDimQK(16, 16);
+            dim3 gridDimQK((current_bc + blockDimQK.x - 1) / blockDimQK.x, (current_br + blockDimQK.y - 1) / blockDimQK.y);
+            QKDotAndScalar_CUDA<<<gridDimQK, blockDimQK>>>(qi_d, kj_d, sij_d, current_br, current_bc, d, 1.0 / sqrt(d));
+
+            int threadsPerBlockRM = 256;
+            int blocksPerGridRM = (current_br + threadsPerBlockRM - 1) / threadsPerBlockRM;
+            RowMax_CUDA<<<blocksPerGridRM, threadsPerBlockRM>>>(mij_d, sij_d, current_br, current_bc);
+
+            dim3 blockDimMME(16, 16);
+            dim3 gridDimMME((current_bc + blockDimMME.x - 1) / blockDimMME.x, (current_br + blockDimMME.y - 1) / blockDimMME.y);
+            MinusMaxAndExp_CUDA<<<gridDimMME, blockDimMME>>>(pij_d, sij_d, mij_d, current_br, current_bc);
+
+            int threadsPerBlockRS = 256;
+            int blocksPerGridRS = (current_br + threadsPerBlockRS - 1) / threadsPerBlockRS;
+            RowSum_CUDA<<<blocksPerGridRS, threadsPerBlockRS>>>(lij_d, pij_d, current_br, current_bc);
+
+            int threadsPerBlockCM = 256;
+            int blocksPerGridCM = (current_br + threadsPerBlockCM - 1) / threadsPerBlockCM;
+            ComputeMiLiNew_CUDA<<<blocksPerGridCM, threadsPerBlockCM>>>(mi_d, li_d, mij_d, lij_d, mi_new_d, li_new_d, current_br);
+
+            dim3 blockDimUO(16, 16);
+            dim3 gridDimUO((d + blockDimUO.x - 1) / blockDimUO.x, (current_br + blockDimUO.y - 1) / blockDimUO.y);
+            UpdateOi_CUDA<<<gridDimUO, blockDimUO>>>(oi_d, mi_d, li_d, mi_new_d, li_new_d, pij_d, vj_d, mij_d, current_br, current_bc, d);
+
+            CopyMiLiNew_CUDA<<<blocksPerGridCM, threadsPerBlockCM>>>(mi_d, li_d, mi_new_d, li_new_d, current_br);
+
+            cudaMemcpy(o_d + i * br * d, oi_d, current_br * d * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(l_d + i * br, li_d, current_br * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(m_d + i * br, mi_d, current_br * sizeof(float), cudaMemcpyDeviceToDevice);
+        }
+    }
+
+    cudaFree(kj_d);
+    cudaFree(vj_d);
+    cudaFree(qi_d);
+    cudaFree(oi_d);
+    cudaFree(li_d);
+    cudaFree(mi_d);
+    cudaFree(sij_d);
+    cudaFree(pij_d);
+    cudaFree(mij_d);
+    cudaFree(lij_d);
+    cudaFree(mi_new_d);
+    cudaFree(li_new_d);
+    cudaFree(l_d);
+    cudaFree(m_d);
+}
+
+__global__ void init_m_kernel(float *m_d, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        m_d[idx] = -FLT_MAX;
+    }
+}
+
+__global__ void QKDotAndScalar_CUDA(float *q_d, float *k_d, float *sij_d, int br, int bc, int d, float scalar) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // i
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // j
+
+    if (row < br && col < bc) {
+        float sum = 0.0f;
+        for (int t = 0; t < d; t++) {
+            sum += q_d[row * d + t] * k_d[col * d + t];
+        }
+        sij_d[row * bc + col] = sum * scalar;
+    }
+}
+
+__global__ void RowMax_CUDA(float *mij_d, float *sij_d, int br, int bc) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < br) {
+        float max_val = sij_d[row * bc];
+        for (int j = 1; j < bc; j++) {
+            float val = sij_d[row * bc + j];
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+        mij_d[row] = max_val;
+    }
+}
+
+__global__ void MinusMaxAndExp_CUDA(float *pij_d, float *sij_d, float *mij_d, int br, int bc) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < br && col < bc) {
+        float val = sij_d[row * bc + col] - mij_d[row];
+        pij_d[row * bc + col] = expf(val);
+    }
+}
+
+__global__ void RowSum_CUDA(float *lij_d, float *pij_d, int br, int bc) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < br) {
+        float sum = 0.0f;
+        for (int j = 0; j < bc; j++) {
+            sum += pij_d[row * bc + j];
+        }
+        lij_d[row] = sum;
+    }
+}
+
+__global__ void ComputeMiLiNew_CUDA(float *mi_d, float *li_d, float *mij_d, float *lij_d, float *mi_new_d, float *li_new_d, int br) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < br) {
+        float mi = mi_d[idx];
+        float mij = mij_d[idx];
+        float li = li_d[idx];
+        float lij = lij_d[idx];
+
+        float mi_new = fmaxf(mi, mij);
+        float li_new = expf(mi - mi_new) * li + expf(mij - mi_new) * lij;
+
+        mi_new_d[idx] = mi_new;
+        li_new_d[idx] = li_new;
+    }
+}
+
+__global__ void UpdateOi_CUDA(float *oi_d, float *mi_d, float *li_d, float *mi_new_d, float *li_new_d, float *pij_d, float *vj_d, float *mij_d, int br, int bc, int d) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // i
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // j
+
+    if (row < br && col < d) {
+        float li = li_d[row];
+        float mi = mi_d[row];
+        float li_new = li_new_d[row];
+        float mi_new = mi_new_d[row];
+        float mij = mij_d[row];
+
+        // Compute pv
+        float pv = 0.0f;
+        for (int t = 0; t < bc; t++) {
+            pv += pij_d[row * bc + t] * vj_d[t * d + col];
+        }
+
+        float oi = oi_d[row * d + col];
+
+        oi_d[row * d + col] = (li * expf(mi - mi_new) * oi + expf(mij - mi_new) * pv) / li_new;
+    }
+}
+
+__global__ void CopyMiLiNew_CUDA(float *mi_d, float *li_d, float *mi_new_d, float *li_new_d, int br) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < br) {
+        mi_d[idx] = mi_new_d[idx];
+        li_d[idx] = li_new_d[idx];
+    }
+}

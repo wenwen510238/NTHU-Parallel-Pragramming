@@ -1,0 +1,268 @@
+#include <stdio.h>
+#include <stdlib.h>
+// #include <cuda_runtime.h>
+#include <cuda.h>
+#include <cassert>
+// #include <device_launch_parameters.h>
+
+#define INF ((1 << 30) - 1)
+#define DEV_NO 0
+cudaDeviceProp prop;
+
+int n, m, v_real;
+int* Dist_host;
+int *Dist_device;
+#define B_factor 64
+
+__global__ void initializeDist(int *Dist_device, int n) {
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int i = blockIdx.x * 32 + tx;
+    int j = blockIdx.y * 32 + ty;
+    int idx = j * n + i;
+
+    if (i == j)
+        Dist_device[idx] = 0;
+    else
+        Dist_device[idx] = INF;
+}
+
+// __global__ void updateDist(int *Dist_device, int *edges_device, int m, int n) {
+//     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+//     if (idx < m) {
+//         int u = edges_device[idx * 3];
+//         int v = edges_device[idx * 3 + 1];
+//         int weight = edges_device[idx * 3 + 2];
+//         Dist_device[u * n + v] = weight;
+//     }
+// }
+__global__ void updateDist(int *Dist_device, int *edges_device, int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < m) {
+        int base_idx = idx * 3;
+        int u = edges_device[base_idx];
+        int v = edges_device[base_idx + 1];
+        int weight = edges_device[base_idx + 2];
+
+        atomicMin(&Dist_device[u * n + v], weight);
+    }
+}
+
+
+void input(char* infile) {
+    FILE* file = fopen(infile, "rb");
+    fread(&n, sizeof(int), 1, file);
+    fread(&m, sizeof(int), 1, file);
+    v_real = n;
+    if(n % B_factor != 0)  n += (B_factor - n % B_factor);
+    long size = n * n * sizeof(int);
+
+    cudaMalloc((void**)&Dist_device, size);
+
+    dim3 threadsPerBlock(32, 32);
+    dim3 blocksPerGrid(n/32, n/32);
+    initializeDist<<<blocksPerGrid, threadsPerBlock>>>(Dist_device, n);
+
+    int *edges = (int*)malloc(m * 3 * sizeof(int));
+    fread(edges, sizeof(int), m * 3, file);
+    fclose(file);
+
+    int *edges_device;
+    cudaMalloc((void**)&edges_device, m * 3 * sizeof(int));
+    cudaMemcpy(edges_device, edges, m * 3 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+
+
+    int thread = 1024;
+    int blocks = (m + thread - 1) / thread;
+    updateDist<<<blocks, thread>>>(Dist_device, edges_device, m, n);
+
+    free(edges);
+
+    Dist_host = (int*)malloc(size);
+    cudaHostRegister(Dist_host, size, cudaHostRegisterDefault);
+    cudaDeviceSynchronize();
+
+    cudaFree(edges_device);
+    // free(edges);
+}
+
+void output(char* outFileName) {
+    FILE* outfile = fopen(outFileName, "wb");
+    for (int i = 0; i < v_real; ++i) {
+        fwrite(&Dist_host[i * n], sizeof(int), v_real, outfile);
+    }
+    fclose(outfile);
+}
+
+__global__ void phase1(int* Dist, int round, int n) {
+    __shared__ int shared_mem[B_factor][B_factor];
+    int x = threadIdx.x;
+    int y = threadIdx.y;
+    int x_global = x + round * B_factor;
+    int y_global = y + round * B_factor;
+    int ind_global = y_global * n + x_global;
+
+    shared_mem[y][x] = Dist[ind_global];
+    shared_mem[y][x + 32] = Dist[ind_global + 32];
+    shared_mem[y + 32][x] = Dist[ind_global + n * 32];
+    shared_mem[y + 32][x + 32] = Dist[ind_global + n * 32 + 32];
+    __syncthreads();
+
+    // #pragma unroll
+    for (int k = 0; k < B_factor; ++k) {
+        shared_mem[y][x] = min(shared_mem[y][x], shared_mem[y][k] + shared_mem[k][x]);
+        shared_mem[y][x + 32] = min(shared_mem[y][x + 32], shared_mem[y][k] + shared_mem[k][x + 32]);
+        shared_mem[y + 32][x] = min(shared_mem[y + 32][x], shared_mem[y + 32][k] + shared_mem[k][x]);
+        shared_mem[y + 32][x + 32] = min(shared_mem[y + 32][x + 32], shared_mem[y + 32][k] + shared_mem[k][x + 32]);
+        __syncthreads();
+    }
+
+    Dist[ind_global] = shared_mem[y][x];
+    Dist[ind_global + 32] = shared_mem[y][x + 32];
+    Dist[ind_global + n * 32] = shared_mem[y + 32][x];
+    Dist[ind_global + n * 32 + 32] = shared_mem[y + 32][x + 32];
+}
+
+__global__ void phase2(int* Dist, int round, int n){
+    // if(round == blockIdx.x) return;
+    const int block_x = (blockIdx.x >= round) ? blockIdx.x + 1 : blockIdx.x ;
+    __shared__ int shared_row[B_factor][B_factor];
+    __shared__ int shared_col[B_factor][B_factor];
+    __shared__ int shared_pivot[B_factor][B_factor];
+
+    int x = threadIdx.x;
+    int y = threadIdx.y;
+    int x_global = x + round * B_factor;
+    int y_global = y + round * B_factor;
+
+    //pivot
+    int ind_global = y_global * n + x_global;
+    shared_pivot[y][x] = Dist[ind_global];
+    shared_pivot[y][x + 32] = Dist[ind_global + 32];
+    shared_pivot[y + 32][x] = Dist[ind_global + n * 32];
+    shared_pivot[y + 32][x + 32] = Dist[ind_global + n * 32 + 32];
+    //shared_row
+    int row_x = x + block_x * B_factor;
+    int ind_row_global = y_global * n + row_x;
+    shared_row[y][x] = Dist[ind_row_global];
+    shared_row[y][x + 32] = Dist[ind_row_global + 32];
+    shared_row[y + 32][x] = Dist[ind_row_global + n * 32];
+    shared_row[y + 32][x + 32] = Dist[ind_row_global + n * 32 + 32];
+    //shared_col
+    int col_y = y + block_x * B_factor;
+    int ind_col_global = col_y * n + x_global;
+    shared_col[y][x] = Dist[ind_col_global];
+    shared_col[y][x + 32] = Dist[ind_col_global + 32];
+    shared_col[y + 32][x] = Dist[ind_col_global + n * 32];
+    shared_col[y + 32][x + 32] = Dist[ind_col_global + n * 32 + 32];
+    __syncthreads();
+
+    // #pragma unroll
+    for (int k = 0; k < B_factor; ++k) {
+        shared_row[y][x] = min(shared_row[y][x], shared_pivot[y][k] + shared_row[k][x]);
+        shared_row[y][x + 32] = min(shared_row[y][x + 32], shared_pivot[y][k] + shared_row[k][x + 32]);
+        shared_row[y + 32][x] = min(shared_row[y + 32][x], shared_pivot[y + 32][k] + shared_row[k][x]);
+        shared_row[y + 32][x + 32] = min(shared_row[y + 32][x + 32], shared_pivot[y + 32][k] + shared_row[k][x + 32]);
+
+        shared_col[y][x] = min(shared_col[y][x], shared_col[y][k] + shared_pivot[k][x]);
+        shared_col[y][x + 32] = min(shared_col[y][x + 32], shared_col[y][k] + shared_pivot[k][x + 32]);
+        shared_col[y + 32][x] = min(shared_col[y + 32][x], shared_col[y + 32][k] + shared_pivot[k][x]);
+        shared_col[y + 32][x + 32] = min(shared_col[y + 32][x + 32], shared_col[y + 32][k] + shared_pivot[k][x + 32]);
+        __syncthreads();
+    }
+
+    Dist[ind_row_global] = shared_row[y][x];
+    Dist[ind_row_global + 32] = shared_row[y][x + 32];
+    Dist[ind_row_global + n * 32] = shared_row[y + 32][x];
+    Dist[ind_row_global + n * 32 + 32] = shared_row[y + 32][x + 32];
+
+    Dist[ind_col_global] = shared_col[y][x];
+    Dist[ind_col_global + 32] = shared_col[y][x + 32];
+    Dist[ind_col_global + n * 32] = shared_col[y + 32][x];
+    Dist[ind_col_global + n * 32 + 32] = shared_col[y + 32][x + 32];
+}
+
+__global__ void phase3(int* Dist, int round, int n) {
+    // if(round == blockIdx.x || round == blockIdx.y)  return;
+
+    const int block_y = (blockIdx.y >= round) ? blockIdx.y + 1 : blockIdx.y ;
+    const int block_x = (blockIdx.x >= round) ? blockIdx.x + 1 : blockIdx.x ;
+
+    __shared__ int shared_row[B_factor][B_factor];
+    __shared__ int shared_col[B_factor][B_factor];
+    __shared__ int shared_mem[B_factor][B_factor];
+
+    int x = threadIdx.x;
+    int y = threadIdx.y;
+    int x_global = x + round * B_factor;
+    int y_global = y + round * B_factor;
+
+    int i = x + block_x * B_factor;
+    int j = y + block_y * B_factor;
+    int ind_global = j * n + i;
+    shared_mem[y][x] = Dist[ind_global];
+    shared_mem[y][x + 32] = Dist[ind_global + 32];
+    shared_mem[y + 32][x] = Dist[ind_global + n * 32];
+    shared_mem[y + 32][x + 32] = Dist[ind_global + n * 32 + 32];
+    //shared_row
+    int ind_col_global = j * n + x_global;
+    shared_col[y][x] = Dist[ind_col_global];
+    shared_col[y][x + 32] = Dist[ind_col_global + 32];
+    shared_col[y + 32][x] = Dist[ind_col_global + n * 32];
+    shared_col[y + 32][x + 32] = Dist[ind_col_global + n * 32 + 32];
+    //shared_col
+    int ind_row_global = y_global * n + i;
+    shared_row[y][x] = Dist[ind_row_global];
+    shared_row[y][x + 32] = Dist[ind_row_global + 32];
+    shared_row[y + 32][x] = Dist[ind_row_global + n * 32];
+    shared_row[y + 32][x + 32] = Dist[ind_row_global + n * 32 + 32];
+    __syncthreads();
+
+    // #pragma unroll 8
+    for (int k = 0; k < B_factor; ++k) {
+        shared_mem[y][x] = min(shared_mem[y][x], shared_col[y][k] + shared_row[k][x]);
+        shared_mem[y][x + 32] = min(shared_mem[y][x + 32], shared_col[y][k] + shared_row[k][x + 32]);
+        shared_mem[y + 32][x] = min(shared_mem[y + 32][x], shared_col[y + 32][k] + shared_row[k][x]);
+        shared_mem[y + 32][x + 32] = min(shared_mem[y + 32][x + 32], shared_col[y + 32][k] + shared_row[k][x + 32]);
+    }
+
+    Dist[ind_global] = shared_mem[y][x];
+    Dist[ind_global + 32] = shared_mem[y][x + 32];
+    Dist[ind_global + n * 32] = shared_mem[y + 32][x];
+    Dist[ind_global + n * 32 + 32] = shared_mem[y + 32][x + 32];
+}
+
+
+int main(int argc, char* argv[]) {
+    input(argv[1]);
+    cudaDeviceSynchronize();
+
+    // cudaGetDeviceProperties(&prop, DEV_NO);
+    // printf("maxThreasPerBlock = %d, sharedMemPerBlock = %d\n", prop.maxThreadsPerBlock, prop.sharedMemPerBlock);
+    size_t d_size = n * n * sizeof(int);
+
+    int round = n/B_factor;
+    dim3 threadsPerBlock(32, 32);
+    dim3 grid_phase2(round-1, 1);
+    dim3 grid_phase3(round-1, round-1);
+
+    for (int r = 0; r < round; ++r) {
+        phase1<<<1, threadsPerBlock>>>(Dist_device, r, n);
+
+        phase2<<<grid_phase2, threadsPerBlock>>>(Dist_device, r, n);
+
+        phase3<<<grid_phase3, threadsPerBlock>>>(Dist_device, r, n);
+    }
+
+    cudaMemcpy(Dist_host, Dist_device, d_size, cudaMemcpyDeviceToHost);
+    output(argv[2]);
+
+    cudaFree(Dist_device);
+    // cudaFreeHost(Dist_host);
+    cudaHostUnregister(Dist_host);
+    free(Dist_host);
+    return 0;
+}

@@ -1,0 +1,410 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+#include <sys/time.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+#define BLOCK_SIZE 32
+// #define BLOCK_SIZE_32 32
+#define MAX_BC 64
+#define MAX_D 64
+
+double getTimeStamp() {
+    struct timeval tv;
+    gettimeofday( &tv, NULL );
+    return (double) tv.tv_usec/1000000 + tv.tv_sec;
+}
+
+int B, N, d;
+float *Q, *K, *V, *O;
+float *Q_d, *K_d, *V_d, *O_d;
+
+void input(char *input_filename) {
+    FILE *file = fopen(input_filename, "rb");
+
+    fread(&B, sizeof(int), 1, file);
+    fread(&N, sizeof(int), 1, file);
+    fread(&d, sizeof(int), 1, file);
+
+    size_t total_size = B * N * d * sizeof(float);
+
+    Q = (float *)malloc(total_size);
+    K = (float *)malloc(total_size);
+    V = (float *)malloc(total_size);
+    O = (float *)malloc(total_size);
+
+    for (int i = 0; i < B; i++) {
+        fread(Q + (i * N * d), sizeof(float), N * d, file);
+        fread(K + (i * N * d), sizeof(float), N * d, file);
+        fread(V + (i * N * d), sizeof(float), N * d, file);
+    }
+    memset(O, 0x00, total_size);
+
+    fclose(file);
+
+    // Allocate device memory
+    cudaMalloc((void **)&Q_d, total_size);
+    cudaMalloc((void **)&K_d, total_size);
+    cudaMalloc((void **)&V_d, total_size);
+    cudaMalloc((void **)&O_d, total_size);
+
+    // Copy data from host to device
+    cudaMemcpy(Q_d, Q, total_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(K_d, K, total_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(V_d, V, total_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(O_d, O, total_size, cudaMemcpyHostToDevice);
+}
+
+void output(char *output_filename) {
+    size_t total_size = B * N * d * sizeof(float);
+
+    // Copy data from device to host
+    // cudaMemcpy(O, O_d, total_size, cudaMemcpyDeviceToHost);
+    // FILE *file = fopen(output_filename, "wb");
+    // fwrite(O, sizeof(float), B * N * d, file);
+
+    int fd = open(output_filename, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    ftruncate(fd, total_size);
+    float *mapPtr = (float*) mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    // memcpy(mapPtr, O, total_size);
+    close(fd);
+
+    cudaHostRegister(mapPtr, total_size, cudaHostRegisterDefault);
+    cudaMemcpy(mapPtr, O_d, total_size, cudaMemcpyDeviceToHost);
+
+    free(Q);
+    free(K);
+    free(V);
+    free(O);
+
+    // Free device memory
+    cudaFree(Q_d);
+    cudaFree(K_d);
+    cudaFree(V_d);
+    cudaFree(O_d);
+    munmap(mapPtr, total_size);
+    // fclose(file);
+}
+
+__global__ void init_m_kernel(float *m_d, float *l_d) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    m_d[idx] = -FLT_MAX;
+    l_d[idx] = 0;
+}
+
+__global__ void QKDotAndScalar(float *q_d, int qo_offset, float *k_d, int kv_offset, float *sij_d, int bc, int d, float scalar) {
+    int row = blockIdx.y * blockDim.x + threadIdx.y;
+    int col = blockIdx.x * blockDim.y + threadIdx.x;
+
+    float sum = 0.0f;
+
+    __shared__ float q_shared[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float k_shared[BLOCK_SIZE][BLOCK_SIZE];
+
+    for (int m = 0; m < d; m += BLOCK_SIZE) {
+        q_shared[threadIdx.y][threadIdx.x] = q_d[qo_offset + row * d + m + threadIdx.x];
+
+        k_shared[threadIdx.x][threadIdx.y] = k_d[kv_offset + col * d + m + threadIdx.y];
+        __syncthreads();
+        for (int t = 0; t < BLOCK_SIZE; ++t)
+            sum += q_shared[threadIdx.y][t] * k_shared[threadIdx.x][t];
+        __syncthreads();
+    }
+
+    sij_d[row * bc + col] = sum * scalar;
+}
+
+// __global__ void QKDotAndScalar(float *q_d, int qo_offset, float *k_d, int kv_offset, float *sij_d, int bc, int d, float scalar) {
+//     // int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+//     // int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+//     int row = blockIdx.x * blockDim.x + threadIdx.x;
+//     float sum = 0.0f;
+//     __shared__ float q_shared[BLOCK_SIZE * BLOCK_SIZE];
+//     __shared__ float k_shared[BLOCK_SIZE * BLOCK_SIZE];
+//     for (int m = 0; m < d / BLOCK_SIZE; ++m) {
+//         q_shared[threadIdx.y][threadIdx.x] = q_d[qo_offset + row * d + m * BLOCK_SIZE + threadIdx.x];
+//         k_shared[threadIdx.x][threadIdx.y] = k_d[kv_offset + col * d + m * BLOCK_SIZE + threadIdx.y];
+//         __syncthreads();
+//         for (int t = 0; t < BLOCK_SIZE; ++t)
+//             sum += q_shared[threadIdx.y][t] * k_shared[threadIdx.x][t];
+//         __syncthreads();
+//     }
+//     sij_d[row * bc + col] = sum * scalar;
+// }
+
+// __global__ void RowMax(float *mij_d, float *sij_d, int br, int bc) {
+//     int row = blockIdx.x * blockDim.x + threadIdx.x;
+//     float max_val = sij_d[row * bc];
+//     for (int j = 1; j < bc; j++) {
+//         float val = sij_d[row * bc + j];
+//         // max_val = max(max_val, val)
+//         if (val > max_val)   max_val = val;
+//     }
+//     mij_d[row] = max_val;
+// }
+
+__global__ void RowMax(float *lij_d, float *pij_d, float *mij_d, float *sij_d, int br, int bc) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    float val;
+    __shared__ float shared_pij_d[BLOCK_SIZE * MAX_BC];
+    __shared__ float shared_sij_d[BLOCK_SIZE * MAX_BC];
+    for(int i = 0; i < BLOCK_SIZE; i++){
+        for (int t = 0; t < bc; t += BLOCK_SIZE) {
+            // shared_pij_d[i * bc + t + threadIdx.x] = pij_d[(blockIdx.x * blockDim.x + i) * bc + t + threadIdx.x];
+            shared_sij_d[i * bc + t + threadIdx.x] = sij_d[(blockIdx.x * blockDim.x + i) * bc + t + threadIdx.x];
+        }
+    }
+    __syncthreads();
+    float max_val = shared_sij_d[threadIdx.x * bc];
+
+    for (int j = 1; j < bc; j++) {
+        // max_val = max(max_val, val)
+        val = shared_sij_d[threadIdx.x * bc + j];
+
+        if (val > max_val)   max_val = val;
+    }
+    mij_d[row] = max_val;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int j = 0; j < bc; j++) {
+        val = expf(shared_sij_d[threadIdx.x * bc + j] - max_val);
+        pij_d[row * bc + j] = val;
+        sum += val;
+
+    }
+    lij_d[row] = sum;
+}
+
+// __global__ void RowMax(float *lij_d, float *pij_d, float *mij_d, float *sij_d, int br, int bc) {
+//     int row = blockIdx.y * blockDim.y + threadIdx.y;
+//     int col = blockIdx.x * blockDim.x + threadIdx.x;
+//     float max_val;
+//     float val;
+//     if(col == 0){
+//         max_val = sij_d[row * bc];
+//         for (int j = 1; j < bc; j++) {
+//             val = sij_d[row * bc + j];
+//             // max_val = max(max_val, val)
+//             if (val > max_val)   max_val = val;
+//         }
+//     }
+//     mij_d[row] = max_val;
+//     __syncthreads();
+//     val = sij_d[row * bc + col] - mij_d[row];
+//     pij_d[row * bc + col] = expf(val);
+//     __syncthreads();
+// }
+
+__global__ void MinusMaxAndExp(float *pij_d, float *sij_d, float *mij_d, int br, int bc) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = sij_d[row * bc + col] - mij_d[row];
+    pij_d[row * bc + col] = expf(val);
+}
+
+
+__global__ void RowSum(float *lij_d, float *pij_d, int br, int bc) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    float sum = 0.0f;
+    for (int j = 0; j < bc; j++) {
+        sum += pij_d[row * bc + j];
+    }
+    lij_d[row] = sum;
+}
+
+__global__ void UpdateMiLiOi(float *oi_d, int qo_offset, float *q_d, float *k_d, float *sij_d, float *mi_d, int ml_offset, float *li_d, float *vj_d, int kv_offset, int bc, int d) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    float val, mij = -FLT_MAX, lij_d = 0.0f;
+    // float max_val = -FLT_MAX;
+    float sij[MAX_BC];
+    float pij[MAX_BC];
+    // __shared__ float shared_pij_d[BLOCK_SIZE * MAX_BC];
+    __shared__ float shared_vj_d[MAX_BC * MAX_D];
+    // __shared__ float shared_kj_d[MAX_BC * MAX_D];
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    ///////////////////////////// row max //////////////////////////////////////////////////////////////////////////////////
+    // __shared__ float shared_sij_d[BLOCK_SIZE * MAX_BC];
+    // for(int i = 0; i < BLOCK_SIZE; i++){
+    //     for (int t = 0; t < bc; t += BLOCK_SIZE) {
+    //         shared_sij_d[i * bc + t + threadIdx.x] = sij_d[(blockIdx.x * blockDim.x + i) * bc + t + threadIdx.x];
+    //     }
+    // }
+    // float max_val = shared_sij_d[threadIdx.x * bc];
+    mij = sij_d[row * bc];
+    sij[0] = mij;
+    for (int j = 1; j < bc; j++) {
+        // val = shared_sij_d[threadIdx.x * bc + j];
+        sij[j] = sij_d[row * bc + j];
+
+        if (sij[j] > mij)   mij = sij[j];
+    }
+    // mij = max_val;
+    __syncthreads();
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////// Minus max and exp /////////////////////////////////////////////////////////////////////////
+    // float sum = 0.0f;
+    for (int j = 0; j < bc; j++) {
+        // val = expf(shared_sij_d[threadIdx.x * bc + j] - max_val);
+        val = expf(sij[j] - mij);
+        // shared_pij_d[threadIdx.x * bc + j] = val;
+        pij[j] = val;
+        lij_d += val;
+    }
+    // lij_d = sum;
+    __syncthreads();
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /////////////////////////////////// update //////////////////////////////////////////////////////////////////////////////
+    // int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ml_ind = ml_offset + row;
+    float mi_new, li_new;
+    float m_d = mi_d[ml_ind], l_d = li_d[ml_ind];
+    // float mij = mij_d[idx];
+
+
+    // int i = threadIdx.x;
+    // for (int t = 0; t < bc; t ++) {
+    //     shared_pij_d[i * bc + t ] = pij_d[(blockIdx.x * blockDim.x + i) * bc + t];
+    // }
+    // for(int i = 0; i < BLOCK_SIZE; i++){
+    //     for (int t = 0; t < bc; t += BLOCK_SIZE) {
+    //         shared_pij_d[i * bc + t + threadIdx.x] = pij_d[(blockIdx.x * blockDim.x + i) * bc + t + threadIdx.x];
+    //     }
+    // }
+
+    for(int t = 0; t < bc; t++){
+        for(int i = 0; i < d; i += BLOCK_SIZE){
+            shared_vj_d[(i + threadIdx.x)*bc + t] = vj_d[kv_offset + t * d + i + threadIdx.x];
+        }
+    }
+
+    // for(int t = 0; t < d; t++){
+    //     for(int i = 0; i < bc; i += BLOCK_SIZE){
+    //         shared_vj_d[t*bc + i + threadIdx.x] = vj_d[kv_offset + (i + threadIdx.x) * d + t];
+    //     }
+    // }
+
+
+    __syncthreads();
+
+    mi_new = max(m_d, mij);
+    li_new = exp(m_d - mi_new) * l_d + exp(mij - mi_new) * lij_d;
+
+    for (int i = 0; i < d; i++) {
+        float pv = 0.0f;
+
+        for (int t = 0; t < bc; t++) {
+            // pv += shared_pij_d[threadIdx.x * bc + t] * shared_vj_d[t * d + i];
+            pv += pij[t] * shared_vj_d[i * bc + t];
+            // pv += shared_pij_d[threadIdx.x * bc + t] * shared_vj_d[i * bc + t];
+        }
+
+        oi_d[qo_offset + row * d + i] = (l_d * exp(m_d - mi_new) * oi_d[qo_offset + row * d + i] + exp(mij - mi_new) * pv) / li_new;
+    }
+
+    mi_d[ml_ind] = mi_new;
+    li_d[ml_ind] = li_new;
+}
+
+void flash_attention(float *q_d, float *k_d, float *v_d, float *o_d) {
+    float *l_d, *m_d;
+    cudaMalloc((void **)&l_d, N * sizeof(float));
+    cudaMalloc((void **)&m_d, N * sizeof(float));
+
+    float *sij_d;
+
+    int bc = MAX_BC, br = N;
+    // int bc = min(MAX_BC, N), br = N;
+
+    int tr = (N + br - 1) / br, tc = (N + bc - 1) / bc;
+
+    size_t sij_size = br * bc * sizeof(float);
+    // size_t pij_size = br * bc * sizeof(float);
+    // size_t mij_size = br * sizeof(float);
+    // size_t lij_size = br * sizeof(float);
+
+    cudaMalloc((void **)&sij_d, sij_size);
+    // cudaMalloc((void **)&pij_d, pij_size);
+    // cudaMalloc((void **)&mij_d, mij_size);
+    // cudaMalloc((void **)&lij_d, lij_size);
+    int threadsPerBlock_init = min(1024, N);
+    int blocksPerGrid_init = N/ threadsPerBlock_init;
+    for (int k = 0; k < B; k++) {
+        // cudaMemset(l_d, 0, N * sizeof(float));
+        init_m_kernel<<<blocksPerGrid_init, threadsPerBlock_init>>>(m_d, l_d);
+        size_t offset = k * N * d;
+        for (int j = 0; j < tc; j++) {
+            int kv_offset = offset + j * bc * d;
+            for (int i = 0; i < tr; i++) {
+                int qo_offset = offset + i * br * d;
+                int ml_offset = i * br;
+
+                dim3 blockDimQK(32, 32);
+                dim3 gridDimQK(bc / blockDimQK.x, br / blockDimQK.y);
+                QKDotAndScalar<<<gridDimQK, blockDimQK>>>(q_d, qo_offset, k_d, kv_offset, sij_d, bc, d, 1.0 / sqrt(d));
+
+                int threadsPerBlock = BLOCK_SIZE;
+                // int blocksPerGridRM = br / threadsPerBlock;
+                // dim3 blockDimMME(BLOCK_SIZE, BLOCK_SIZE);
+                // dim3 gridDimMME(bc / blockDimMME.x, br / blockDimMME.y);
+                // RowMax<<<gridDimMME, blockDimMME>>>(pij_d, mij_d, sij_d, br, bc);
+                // RowMax<<<blocksPerGridRM, threadsPerBlock>>>(lij_d, pij_d, mij_d, sij_d, br, bc);
+                // RowMax<<<blocksPerGridRM, threadsPerBlock>>>(mij_d, sij_d, br, bc);
+
+                // dim3 blockDimMME(BLOCK_SIZE, BLOCK_SIZE);
+                // dim3 gridDimMME(bc/ blockDimMME.x, br/ blockDimMME.y);
+                // MinusMaxAndExp<<<gridDimMME, blockDimMME>>>(pij_d, sij_d, mij_d, br, bc);
+
+                // int threadsPerBlock = BLOCK_SIZE;
+                int blocksPerGrid = br / threadsPerBlock;
+                // RowSum<<<blocksPerGrid, threadsPerBlock>>>(lij_d, pij_d, br, bc);
+
+                // int blocksPerGridOi = (br + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                UpdateMiLiOi<<<blocksPerGrid, threadsPerBlock>>>(o_d, qo_offset, q_d, k_d, sij_d, m_d, ml_offset, l_d, v_d, kv_offset, bc, d);
+            }
+        }
+    }
+    cudaFree(sij_d);
+    // cudaFree(pij_d);
+    // cudaFree(mij_d);
+    // cudaFree(lij_d);
+    cudaFree(l_d);
+    cudaFree(m_d);
+}
+
+
+int main(int argc, char *argv[]) {
+    // if (argc != 3) {
+    //     printf("Usage: %s <input_filename> <output_filename>\n", argv[0]);
+    //     return 1;
+    // }
+
+    input(argv[1]);
+
+    // double start, end;
+    // start = getTimeStamp();
+
+    flash_attention(
+        Q_d,
+        K_d,
+        V_d,
+        O_d
+    );
+
+    // end = getTimeStamp();
+    // printf("(B, N, d): (%d, %d, %d)\n", B, N, d);
+    // printf("Time: %.3f seconds\n", end - start);
+
+    output(argv[2]);
+
+    return 0;
+}

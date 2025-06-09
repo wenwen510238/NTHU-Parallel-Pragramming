@@ -1,0 +1,20 @@
+## sobel cuda ##
+cp -r /home/pp24/share/lab-sobel ~/lab_sobel
+module load rocm cuda 
+Finish the hints 
+Compile the program : make sobel
+Run the program :  srun --gres=gpu:1 ./sobel testcases/candy.png candy.out.png
+Check the diff : png-diff testcases/candy.out.png candy.out.png
+lab-sobel-judge
+lab-sobel-opt-judge
+
+## sobel-amd ##
+module load rocm cuda
+Hipify your CUDA code: hipify-clang sobel.cu
+	Generates sobel.cu.hip
+Inspect the code and learn how HIP works
+Rename the file to sobel.hip
+Compile the program
+	make sobel-amd
+Run : srun -p amd --gres=gpu:1 ./sobel-amd testcases/candy.png candy.out.png
+Judge: lab-sobel-amd-judge
